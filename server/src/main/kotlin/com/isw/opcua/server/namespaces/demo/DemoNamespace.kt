@@ -19,7 +19,7 @@ import org.eclipse.milo.opcua.sdk.server.api.services.AttributeServices.ReadCont
 import org.eclipse.milo.opcua.sdk.server.api.services.AttributeServices.WriteContext
 import org.eclipse.milo.opcua.sdk.server.api.services.MethodServices
 import org.eclipse.milo.opcua.sdk.server.api.services.MethodServices.CallContext
-import org.eclipse.milo.opcua.sdk.server.api.services.ViewServices.BrowseContext
+import org.eclipse.milo.opcua.sdk.server.api.services.ViewServices.*
 import org.eclipse.milo.opcua.sdk.server.model.nodes.objects.ServerNode
 import org.eclipse.milo.opcua.sdk.server.nodes.*
 import org.eclipse.milo.opcua.sdk.server.nodes.factories.NodeFactory
@@ -28,15 +28,17 @@ import org.eclipse.milo.opcua.stack.core.types.builtin.*
 import org.eclipse.milo.opcua.stack.core.types.builtin.unsigned.UInteger
 import org.eclipse.milo.opcua.stack.core.types.builtin.unsigned.UShort
 import org.eclipse.milo.opcua.stack.core.types.builtin.unsigned.Unsigned
-import org.eclipse.milo.opcua.stack.core.types.builtin.unsigned.Unsigned.ubyte
-import org.eclipse.milo.opcua.stack.core.types.builtin.unsigned.Unsigned.ushort
+import org.eclipse.milo.opcua.stack.core.types.builtin.unsigned.Unsigned.*
+import org.eclipse.milo.opcua.stack.core.types.enumerated.IdType
 import org.eclipse.milo.opcua.stack.core.types.enumerated.TimestampsToReturn
 import org.eclipse.milo.opcua.stack.core.types.structured.*
+import org.eclipse.milo.opcua.stack.core.util.Unit
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import java.util.*
 import java.util.concurrent.ConcurrentMap
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 import java.util.function.BiConsumer
 
 class DemoNamespace(
@@ -66,6 +68,9 @@ class DemoNamespace(
 
     private val sampledNodes: ConcurrentMap<DataItem, SampledNode> = Maps.newConcurrentMap()
     private val subscribedNodes: ConcurrentMap<DataItem, SubscribedNode> = Maps.newConcurrentMap()
+
+    private val registeredNodeIds = AtomicLong(1_000_000L)
+    private val registeredNodes: ConcurrentMap<NodeId, NodeId> = Maps.newConcurrentMap()
 
     private val namespaceIndex: UShort = server.namespaceTable.addUri(NAMESPACE_URI)
 
@@ -137,9 +142,9 @@ class DemoNamespace(
     override fun getNamespaceIndex(): UShort = this@DemoNamespace.namespaceIndex
 
     override fun browse(context: BrowseContext, viewDescription: ViewDescription, nodeId: NodeId) {
-        val node: UaNode? = nodeManager[nodeId]
+        val node: UaNode? = nodeManager[nodeId.unalias()]
 
-        val references: List<Reference>? = node?.references ?: maybeTurtleReferences(nodeId)
+        val references: List<Reference>? = node?.references ?: maybeTurtleReferences(nodeId.unalias())
 
         if (references != null) {
             context.success(references)
@@ -154,11 +159,36 @@ class DemoNamespace(
         sourceNodeId: NodeId
     ) {
 
+        val nodeId = sourceNodeId.unalias()
+
         val references: List<Reference> =
-            nodeManager.getReferences(sourceNodeId) +
-                (maybeTurtleReferences(sourceNodeId) ?: emptyList())
+            nodeManager.getReferences(nodeId) +
+                (maybeTurtleReferences(nodeId) ?: emptyList())
 
         context.success(references)
+    }
+
+    override fun registerNodes(context: RegisterNodesContext, nodeIds: List<NodeId>) {
+        val registeredNodeIds = nodeIds.map {
+            if (it.type != IdType.Numeric) {
+                val nextId = registeredNodeIds.getAndIncrement()
+                val registeredNodeId = NodeId(namespaceIndex, uint(nextId))
+
+                registeredNodes[registeredNodeId] = it
+
+                registeredNodeId
+            } else {
+                it
+            }
+        }
+
+        context.success(registeredNodeIds)
+    }
+
+    override fun unregisterNodes(context: UnregisterNodesContext, nodeIds: List<NodeId>) {
+        nodeIds.forEach { registeredNodes.remove(it) }
+
+        context.success(List(nodeIds.size) { Unit.VALUE })
     }
 
     override fun read(
@@ -169,7 +199,9 @@ class DemoNamespace(
     ) {
 
         val values = readValueIds.map { readValueId ->
-            val node: UaNode? = nodeManager[readValueId.nodeId] ?: maybeTurtleNode(readValueId.nodeId)
+            val nodeId = readValueId.nodeId.unalias()
+
+            val node: UaNode? = nodeManager[nodeId] ?: maybeTurtleNode(nodeId)
 
             val value: DataValue? = node?.readAttribute(
                 AttributeContext(context),
@@ -187,7 +219,9 @@ class DemoNamespace(
 
     override fun write(context: WriteContext, writeValues: List<WriteValue>) {
         val results: List<StatusCode> = writeValues.map { writeValue ->
-            val node: UaNode? = nodeManager[writeValue.nodeId]
+            val nodeId = writeValue.nodeId.unalias()
+
+            val node: UaNode? = nodeManager[nodeId]
 
             val status: StatusCode? = node?.run {
                 try {
@@ -333,6 +367,10 @@ class DemoNamespace(
         }
     }
 
+    private fun NodeId.unalias(): NodeId {
+        return registeredNodes.getOrDefault(this, this)
+    }
+
     inner class SampledNode(
         item: DataItem,
         scope: CoroutineScope,
@@ -379,10 +417,6 @@ class DemoNamespace(
 
     }
 
-}
-
-fun Optional<NodeManager<UaNode>>.addNode(node: UaNode) {
-    this.ifPresent { it.addNode(node) }
 }
 
 fun DemoNamespace.addFolderNode(parentNodeId: NodeId, name: String): UaFolderNode {
