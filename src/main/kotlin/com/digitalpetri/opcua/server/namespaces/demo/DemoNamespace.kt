@@ -3,11 +3,12 @@ package com.digitalpetri.opcua.server.namespaces.demo
 import com.digitalpetri.opcua.milo.extensions.defaultValue
 import com.digitalpetri.opcua.milo.extensions.inverseReferenceTo
 import com.digitalpetri.opcua.milo.extensions.resolve
-import com.digitalpetri.opcua.server.sampling.SampledDataItem
-import com.digitalpetri.opcua.server.sampling.TickManager
 import com.google.common.collect.Lists
 import com.google.common.collect.Maps
-import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.channels.sendBlocking
+import kotlinx.coroutines.flow.*
 import org.eclipse.milo.opcua.sdk.core.AccessLevel
 import org.eclipse.milo.opcua.sdk.core.Reference
 import org.eclipse.milo.opcua.sdk.server.AbstractLifecycle
@@ -53,8 +54,6 @@ class DemoNamespace(
 
     private val logger: Logger = LoggerFactory.getLogger(DemoNamespace::class.java)
 
-    private val tickManager = TickManager(coroutineScope)
-
     internal val nodeManager = UaNodeManager()
 
     internal val nodeContext = object : UaNodeContext {
@@ -71,8 +70,7 @@ class DemoNamespace(
 
     private lateinit var eventFuture: ScheduledFuture<*>
 
-    private val sampledNodes: ConcurrentMap<DataItem, SampledNode> = Maps.newConcurrentMap()
-    private val subscribedNodes: ConcurrentMap<DataItem, SubscribedNode> = Maps.newConcurrentMap()
+    private val monitoringJobs: ConcurrentMap<DataItem, Job> = Maps.newConcurrentMap()
 
     private val namespaceIndex: UShort = server.namespaceTable.addUri(NAMESPACE_URI)
 
@@ -126,6 +124,7 @@ class DemoNamespace(
                     eventNode.message = LocalizedText.english("event message!")
                     eventNode.severity = ushort(2)
 
+                    @Suppress("UnstableApiUsage")
                     server.eventBus.post(eventNode)
 
                     eventNode.delete()
@@ -139,7 +138,7 @@ class DemoNamespace(
     override fun onShutdown() {
         eventFuture.cancel(true)
 
-        sampledNodes.values.forEach { it.shutdown() }
+        monitoringJobs.values.forEach { it.cancel() }
 
         dictionaryManager.shutdown()
 
@@ -256,27 +255,44 @@ class DemoNamespace(
         }
     }
 
+    @ExperimentalCoroutinesApi
     override fun onDataItemsCreated(items: List<DataItem>) {
-        items.forEach { item ->
-            val nodeId: NodeId = item.readValueId.nodeId
-            val node: UaNode? = nodeManager.get(nodeId)
+        items.forEach { item -> startMonitoringItem(item) }
+    }
 
-            if (node != null) {
-                if (nodeId.isMassNode()) {
-                    val subscribedNode = SubscribedNode(item, node)
-                    subscribedNode.samplingEnabled = item.isSamplingEnabled
-                    subscribedNode.startup()
+    @ExperimentalCoroutinesApi
+    override fun onDataItemsModified(items: List<DataItem>) {
+        items.forEach {
+            stopMonitoringItem(it)
+            startMonitoringItem(it)
+        }
+    }
 
-                    subscribedNodes[item] = subscribedNode
-                } else {
-                    val sampledNode = SampledNode(item, coroutineScope, node)
-                    sampledNode.samplingEnabled = item.isSamplingEnabled
-                    sampledNode.startup()
+    override fun onDataItemsDeleted(items: List<DataItem>) {
+        items.forEach { stopMonitoringItem(it) }
+    }
 
-                    sampledNodes[item] = sampledNode
-                }
+    @ExperimentalCoroutinesApi
+    private fun startMonitoringItem(item: DataItem) {
+        val nodeId: NodeId = item.readValueId.nodeId
+        val node: UaNode? = nodeManager.get(nodeId)
+
+        if (node != null) {
+            if (nodeId.isMassNode()) {
+                monitoringJobs[item] = coroutineScope.monitorByCallback(node, item)
+            } else {
+                monitoringJobs[item] = coroutineScope.monitorBySampling(node, item)
             }
         }
+    }
+
+    private fun stopMonitoringItem(item: DataItem) {
+        monitoringJobs.remove(item)?.cancel()
+    }
+
+    @ExperimentalCoroutinesApi
+    override fun onMonitoringModeChanged(items: List<MonitoredItem>) {
+        // no action needed; monitoring Jobs check isSamplingEnabled
     }
 
     private fun NodeId.isMassNode(): Boolean {
@@ -284,24 +300,60 @@ class DemoNamespace(
         return id is UInteger && id.toInt() < 26000
     }
 
-    override fun onDataItemsModified(items: List<DataItem>) {
-        items.forEach { item ->
-            sampledNodes[item]?.modifyRate(item.samplingInterval)
+    @ExperimentalCoroutinesApi
+    private fun CoroutineScope.monitorByCallback(node: UaNode, item: DataItem): Job {
+        val flow: Flow<DataValue> = callbackFlow {
+            val observer = AttributeObserver { _, attributeId, value ->
+                if (item.isSamplingEnabled && attributeId.uid() == item.readValueId.attributeId) {
+                    // TODO these values need indexRange, timestamps, dataEncoding, etc... applied
+                    sendBlocking(value as DataValue)
+                }
+            }
+
+            send(
+                node.readAttribute(
+                    AttributeContext(server),
+                    item.readValueId.attributeId,
+                    TimestampsToReturn.Both,
+                    item.readValueId.indexRange,
+                    item.readValueId.dataEncoding
+                )
+            )
+
+            node.addAttributeObserver(observer)
+            awaitClose { node.removeAttributeObserver(observer) }
+        }
+
+        return launch {
+            flow.conflate()
+                .onEach {
+                    item.setValue(it)
+                    delay(item.samplingInterval.toLong())
+                }
+                .collect()
         }
     }
 
-    override fun onDataItemsDeleted(items: List<DataItem>) {
-        items.forEach { item ->
-            sampledNodes.remove(item)?.shutdown()
-            subscribedNodes.remove(item)?.shutdown()
-        }
-    }
+    private fun CoroutineScope.monitorBySampling(node: UaNode, item: DataItem): Job {
+        val flow: Flow<DataValue> = flow {
+            while (true) {
+                if (item.isSamplingEnabled) {
+                    val value: DataValue = node.readAttribute(
+                        AttributeContext(server),
+                        item.readValueId.attributeId,
+                        TimestampsToReturn.Both,
+                        item.readValueId.indexRange,
+                        item.readValueId.dataEncoding
+                    )
 
-    override fun onMonitoringModeChanged(items: List<MonitoredItem>) {
-        items.forEach {
-            sampledNodes[it]?.samplingEnabled = it.isSamplingEnabled
-            subscribedNodes[it]?.samplingEnabled = it.isSamplingEnabled
+                    emit(value)
+                }
+
+                delay(item.samplingInterval.toLong())
+            }
         }
+
+        return launch { flow.onEach { item.setValue(it) }.collect() }
     }
 
     /**
@@ -361,52 +413,6 @@ class DemoNamespace(
                 Optional.empty()
             }
         }
-    }
-
-    inner class SampledNode(
-        item: DataItem,
-        scope: CoroutineScope,
-        private val node: UaNode
-    ) : SampledDataItem(item, scope, tickManager) {
-
-        override suspend fun sampleCurrentValue(currentTime: Long): DataValue {
-            return node.readAttribute(
-                AttributeContext(server),
-                item.readValueId.attributeId,
-                TimestampsToReturn.Both,
-                item.readValueId.indexRange,
-                item.readValueId.dataEncoding
-            )
-        }
-
-    }
-
-    inner class SubscribedNode(
-        private val item: DataItem,
-        private val node: UaNode
-    ) : AbstractLifecycle() {
-
-        @Volatile
-        var samplingEnabled: Boolean = true
-
-        private val targetAttributeId = AttributeId.from(item.readValueId.attributeId).orElseThrow()
-
-        private val attributeObserver = AttributeObserver { _, attributeId, value ->
-            if (samplingEnabled && attributeId == targetAttributeId) {
-                item.setValue(value as DataValue)
-            }
-        }
-
-        override fun onStartup() {
-            item.setValue(node.getAttribute(AttributeContext(server), targetAttributeId))
-
-            node.addAttributeObserver(attributeObserver)
-        }
-
-        override fun onShutdown() {
-            node.removeAttributeObserver(attributeObserver)
-        }
-
     }
 
 }
